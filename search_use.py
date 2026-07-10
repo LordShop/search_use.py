@@ -3,21 +3,22 @@ import sqlite3
 import random
 import string
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+from aiogram.dispatcher import Dispatcher
+from aiogram.dispatcher.filters import Command
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.dispatcher.storage import FSMContext
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 # --- Configuration ---
 BOT_TOKEN = "8877608696:AAHKCXkbBytcv-u7qNJvZSlgWO1Z6I8GBUI"
 OWNER_ID = 8714064096
-ADMIN_IDS = [OWNER_ID]  # Add other admin IDs here
+ADMIN_IDS = [OWNER_ID]
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -31,7 +32,6 @@ class Database:
         self._create_tables()
 
     def _create_tables(self):
-        # Users table
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -46,7 +46,6 @@ class Database:
             )
         """)
         
-        # Promocodes table
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS promocodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +58,6 @@ class Database:
             )
         """)
         
-        # Promocode usage tracking (for 1 use per user)
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS promo_usage (
                 user_id INTEGER,
@@ -69,7 +67,6 @@ class Database:
             )
         """)
         
-        # Found users logs (just for statistics)
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS found_users_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +79,7 @@ class Database:
         
         self.conn.commit()
 
-    def get_user(self, user_id: int) -> Optional[Tuple]:
+    def get_user(self, user_id: int):
         self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         return self.cursor.fetchone()
 
@@ -121,7 +118,7 @@ class Database:
         """, (user_id, found_user, length))
         self.conn.commit()
 
-    def get_user_stats(self, user_id: int) -> Optional[Dict]:
+    def get_user_stats(self, user_id: int):
         user = self.get_user(user_id)
         if user:
             return {
@@ -145,25 +142,22 @@ class Database:
         except sqlite3.IntegrityError:
             return False
 
-    def get_promocode(self, code: str) -> Optional[Tuple]:
+    def get_promocode(self, code: str):
         self.cursor.execute("SELECT * FROM promocodes WHERE code = ?", (code,))
         return self.cursor.fetchone()
 
-    def use_promocode(self, code: str, user_id: int) -> Tuple[bool, str]:
+    def use_promocode(self, code: str, user_id: int):
         promo = self.get_promocode(code)
         if not promo:
             return False, "Промокод не найден!"
         
-        # Check if user already used this promo
         self.cursor.execute("SELECT * FROM promo_usage WHERE user_id = ? AND promo_code = ?", (user_id, code))
         if self.cursor.fetchone():
             return False, "Вы уже использовали этот промокод!"
         
-        # Check max uses
         if promo[3] != -1 and promo[4] >= promo[3]:
             return False, "Промокод больше не действителен!"
         
-        # Apply promo
         self.cursor.execute("""
             UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?
         """, (code,))
@@ -174,16 +168,11 @@ class Database:
         self.conn.commit()
         return True, f"Промокод активирован! Вы получили {promo[2]} запросов!"
 
-    def get_all_users(self) -> List[int]:
+    def get_all_users(self):
         self.cursor.execute("SELECT user_id FROM users")
         return [row[0] for row in self.cursor.fetchall()]
 
-    def get_all_promocodes(self) -> List[Tuple]:
-        self.cursor.execute("SELECT code, requests, max_uses, used_count FROM promocodes ORDER BY created_at DESC")
-        return self.cursor.fetchall()
-
     def get_daily_requests_bonus(self, user_id: int) -> int:
-        """Returns 2 requests for daily bonus if 24h passed since last bonus"""
         self.cursor.execute("""
             SELECT last_bonus_date FROM users WHERE user_id = ?
         """, (user_id,))
@@ -194,10 +183,8 @@ class Database:
         last_bonus = datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S")
         now = datetime.now()
         
-        # Check if 24h passed since last bonus
         if (now - last_bonus).total_seconds() >= 86400:
             self.update_user_requests(user_id, 2)
-            # Update last_bonus_date to now
             self.cursor.execute("""
                 UPDATE users SET last_bonus_date = CURRENT_TIMESTAMP WHERE user_id = ?
             """, (user_id,))
@@ -208,72 +195,54 @@ class Database:
 db = Database()
 
 # --- States ---
-class SearchStates(StatesGroup):
-    choosing_length = State()
-    searching = State()
-
 class PromoStates(StatesGroup):
     waiting_for_promo = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_give = State()
-    waiting_for_delete = State()
-    waiting_for_create_promo = State()
-    waiting_for_promo_name = State()
-    waiting_for_promo_requests = State()
-    waiting_for_promo_uses = State()
 
 # --- Bot & Dispatcher ---
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(bot, storage=storage)
+dp.middleware.setup(LoggingMiddleware())
 
 # --- Helper Functions ---
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def generate_random_username(length: int) -> str:
-    """Generate random username of specified length (letters only)"""
     letters = string.ascii_lowercase
     return ''.join(random.choice(letters) for _ in range(length))
 
-def get_main_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
+def get_main_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    buttons = [
         InlineKeyboardButton(text="🔍 Поиск", callback_data="search"),
-        InlineKeyboardButton(text="📋 Задание", callback_data="tasks")
-    )
-    builder.row(
+        InlineKeyboardButton(text="📋 Задание", callback_data="tasks"),
         InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")
-    )
-    builder.row(
+        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop"),
         InlineKeyboardButton(text="🎟️ Промокод", callback_data="promo"),
-        InlineKeyboardButton(text="🆘 Поддержка", callback_data="support")
-    )
-    builder.row(
-        InlineKeyboardButton(text="👥 Рефералы", callback_data="referrals")
-    )
-    if any(is_admin(user_id) for user_id in [OWNER_ID]):
-        builder.row(
-            InlineKeyboardButton(text="⚙️ Admin Panel", callback_data="admin_panel")
-        )
-    return builder.as_markup()
+        InlineKeyboardButton(text="🆘 Поддержка", callback_data="support"),
+        InlineKeyboardButton(text="👥 Рефералы", callback_data="referrals"),
+    ]
+    keyboard.add(*buttons)
+    
+    if is_admin(OWNER_ID):
+        keyboard.add(InlineKeyboardButton(text="⚙️ Admin Panel", callback_data="admin_panel"))
+    
+    return keyboard
 
-def get_length_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
+def get_length_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    buttons = [
         InlineKeyboardButton(text="5 букв", callback_data="length_5"),
         InlineKeyboardButton(text="6 букв", callback_data="length_6"),
-        InlineKeyboardButton(text="7 букв", callback_data="length_7")
-    )
-    builder.row(
+        InlineKeyboardButton(text="7 букв", callback_data="length_7"),
         InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
-    )
-    return builder.as_markup()
+    ]
+    keyboard.add(*buttons)
+    return keyboard
 
-def get_shop_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
+def get_shop_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
     shop_items = [
         ("10 запросов = 5 ⭐", "shop_10"),
         ("15 запросов = 10 ⭐", "shop_15"),
@@ -284,37 +253,42 @@ def get_shop_keyboard() -> InlineKeyboardMarkup:
         ("500 запросов = 449 ⭐", "shop_500"),
         ("750 запросов = 699 ⭐", "shop_750"),
         ("899 запросов = 849 ⭐", "shop_899"),
-        ("1000 запросов = 888 ⭐", "shop_1000")
+        ("1000 запросов = 888 ⭐", "shop_1000"),
+        ("🔙 Назад", "back_to_main")
     ]
     for text, callback in shop_items:
-        builder.row(InlineKeyboardButton(text=text, callback_data=callback))
-    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"))
-    return builder.as_markup()
+        keyboard.add(InlineKeyboardButton(text=text, callback_data=callback))
+    return keyboard
 
-def get_admin_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="➕ Добавить запросы", callback_data="admin_give"))
-    builder.row(InlineKeyboardButton(text="➖ Удалить запросы", callback_data="admin_delete"))
-    builder.row(InlineKeyboardButton(text="🎟️ Create Promo", callback_data="admin_create_promo"))
-    if OWNER_ID:  # Show hack buttons only for owner
-        builder.row(InlineKeyboardButton(text="➕ Hack", callback_data="admin_hack_plus"))
-        builder.row(InlineKeyboardButton(text="➖ Hack", callback_data="admin_hack_minus"))
-    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"))
-    return builder.as_markup()
+def get_admin_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    buttons = [
+        InlineKeyboardButton(text="➕ Добавить запросы", callback_data="admin_give"),
+        InlineKeyboardButton(text="➖ Удалить запросы", callback_data="admin_delete"),
+        InlineKeyboardButton(text="🎟️ Create Promo", callback_data="admin_create_promo"),
+    ]
+    
+    if is_admin(OWNER_ID):
+        buttons.append(InlineKeyboardButton(text="➕ Hack", callback_data="admin_hack_plus"))
+        buttons.append(InlineKeyboardButton(text="➖ Hack", callback_data="admin_hack_minus"))
+    
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"))
+    
+    for btn in buttons:
+        keyboard.add(btn)
+    return keyboard
 
-# --- Message Handlers ---
-@dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+# --- Handlers ---
+@dp.message_handler(Command("start"))
+async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or ""
     last_name = message.from_user.last_name or ""
     
-    # Create user if not exists
     if not db.get_user(user_id):
         db.create_user(user_id, username, first_name, last_name)
     
-    # Check for daily bonus
     bonus = db.get_daily_requests_bonus(user_id)
     bonus_text = f"\n\n🎁 Вы получили +{bonus} запросов за сегодня!" if bonus > 0 else ""
     
@@ -327,12 +301,10 @@ async def cmd_start(message: Message, state: FSMContext):
     
     await message.answer(welcome_text, reply_markup=get_main_keyboard())
 
-@dp.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
+@dp.callback_query_handler(lambda c: c.data == "back_to_main")
+async def back_to_main(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
     
-    # Check for daily bonus
     bonus = db.get_daily_requests_bonus(user_id)
     bonus_text = f"\n\n🎁 Вы получили +{bonus} запросов за сегодня!" if bonus > 0 else ""
     
@@ -341,62 +313,60 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
         f"📊 У вас {db.get_user_requests(user_id)} запросов.{bonus_text}\n\n"
         f"Выберите действие:"
     )
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard())
-    await callback.answer()
+    await bot.edit_message_text(text, callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_main_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "search")
-async def cmd_search(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+@dp.callback_query_handler(lambda c: c.data == "search")
+async def cmd_search(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
     requests_left = db.get_user_requests(user_id)
     
     if requests_left <= 0:
-        await callback.answer("❌ У вас нет запросов! Дождитесь следующего дня для получения 2 запросов.", show_alert=True)
+        await callback_query.answer("❌ У вас нет запросов! Дождитесь следующего дня.", show_alert=True)
         return
     
-    await callback.message.edit_text(
-        "🔍 Выберите длину юзернейма для поиска:",
+    await bot.edit_message_text(
+        "🔍 Выберите длину юзернейма:",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
         reply_markup=get_length_keyboard()
     )
-    await callback.answer()
+    await callback_query.answer()
 
-@dp.callback_query(F.data.startswith("length_"))
-async def search_by_length(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    length = int(callback.data.split("_")[1])
+@dp.callback_query_handler(lambda c: c.data.startswith("length_"))
+async def search_by_length(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    length = int(callback_query.data.split("_")[1])
     
-    requests_left = db.get_user_requests(user_id)
-    if requests_left <= 0:
-        await callback.answer("❌ У вас нет запросов!", show_alert=True)
+    if db.get_user_requests(user_id) <= 0:
+        await callback_query.answer("❌ У вас нет запросов!", show_alert=True)
         return
     
-    # Generate random username
     username = generate_random_username(length)
-    
-    # Deduct request
     db.update_user_requests(user_id, -1)
     db.increment_found_users(user_id)
     db.log_found_user(user_id, username, length)
     
-    await callback.message.edit_text(
-        f"✅ Найден юзернейм:\n\n"
-        f"@{username}\n\n"
-        f"📊 Осталось запросов: {db.get_user_requests(user_id)}",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔍 Еще поиск", callback_data="search")],
-                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
-            ]
-        )
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton(text="🔍 Еще поиск", callback_data="search"),
+        InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")
     )
-    await callback.answer()
-
-@dp.callback_query(F.data == "profile")
-async def cmd_profile(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    stats = db.get_user_stats(user_id)
     
+    await bot.edit_message_text(
+        f"✅ Найден юзернейм:\n\n@{username}\n\n"
+        f"📊 Осталось запросов: {db.get_user_requests(user_id)}",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+    await callback_query.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "profile")
+async def cmd_profile(callback_query: types.CallbackQuery):
+    stats = db.get_user_stats(callback_query.from_user.id)
     if not stats:
-        await callback.answer("❌ Ошибка! Пользователь не найден.", show_alert=True)
+        await callback_query.answer("❌ Ошибка!", show_alert=True)
         return
     
     profile_text = (
@@ -407,14 +377,14 @@ async def cmd_profile(callback: CallbackQuery):
         f"4️⃣ Запросов: {stats['requests']}"
     )
     
-    await callback.message.edit_text(profile_text, reply_markup=get_main_keyboard())
-    await callback.answer()
+    await bot.edit_message_text(profile_text, callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_main_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "shop")
-async def cmd_shop(callback: CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "shop")
+async def cmd_shop(callback_query: types.CallbackQuery):
     shop_text = (
         "🛒 Магазин запросов\n\n"
-        "Для покупки запросов пишите @Haremilove\n"
+        "Для покупки пишите @Haremilove\n"
         "Одним сообщением, спам = ЧС!\n\n"
         "💰 Цены:\n"
         "1. 10 запросов = 5 ⭐\n"
@@ -429,108 +399,82 @@ async def cmd_shop(callback: CallbackQuery):
         "10. 1000 запросов = 888 ⭐"
     )
     
-    await callback.message.edit_text(shop_text, reply_markup=get_shop_keyboard())
-    await callback.answer()
+    await bot.edit_message_text(shop_text, callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_shop_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "promo")
-async def cmd_promo(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text(
-        "🎟️ Введите промокод:\n\n"
-        "Пример: Test",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
-            ]
-        )
+@dp.callback_query_handler(lambda c: c.data == "promo")
+async def cmd_promo(callback_query: types.CallbackQuery):
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"))
+    
+    await bot.edit_message_text(
+        "🎟️ Введите промокод:",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
     )
-    await state.set_state(PromoStates.waiting_for_promo)
-    await callback.answer()
+    await PromoStates.waiting_for_promo.set()
+    await callback_query.answer()
 
-@dp.message(PromoStates.waiting_for_promo)
-async def process_promo(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    promo_code = message.text.strip()
+@dp.message_handler(state=PromoStates.waiting_for_promo)
+async def process_promo(message: types.Message, state: FSMContext):
+    success, result = db.use_promocode(message.text.strip(), message.from_user.id)
     
-    success, result = db.use_promocode(promo_code, user_id)
-    
-    if success:
-        await message.answer(
-            f"✅ {result}\n"
-            f"📊 У вас {db.get_user_requests(user_id)} запросов.",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        await message.answer(
-            f"❌ {result}",
-            reply_markup=get_main_keyboard()
-        )
-    
-    await state.clear()
-
-@dp.callback_query(F.data == "support")
-async def cmd_support(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🆘 Поддержка\n\n"
-        "По всем вопросам обращайтесь к владельцу:\n"
-        "@Haremilove\n\n"
-        "Опишите вашу проблему подробно.",
+    await message.answer(
+        f"{'✅' if success else '❌'} {result}\n"
+        f"📊 У вас {db.get_user_requests(message.from_user.id)} запросов.",
         reply_markup=get_main_keyboard()
     )
-    await callback.answer()
+    await state.finish()
 
-@dp.callback_query(F.data == "tasks")
-async def cmd_tasks(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "📋 Задания\n\n"
-        "В разработке...",
+@dp.callback_query_handler(lambda c: c.data == "support")
+async def cmd_support(callback_query: types.CallbackQuery):
+    await bot.edit_message_text(
+        "🆘 Поддержка\n\nПо всем вопросам: @Haremilove",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
         reply_markup=get_main_keyboard()
     )
-    await callback.answer()
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "referrals")
-async def cmd_referrals(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "👥 Реферальная система\n\n"
-        "В разработке...",
-        reply_markup=get_main_keyboard()
-    )
-    await callback.answer()
+@dp.callback_query_handler(lambda c: c.data == "tasks")
+async def cmd_tasks(callback_query: types.CallbackQuery):
+    await bot.edit_message_text("📋 В разработке...", callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_main_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "admin_panel")
-async def cmd_admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "referrals")
+async def cmd_referrals(callback_query: types.CallbackQuery):
+    await bot.edit_message_text("👥 В разработке...", callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_main_keyboard())
+    await callback_query.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "admin_panel")
+async def cmd_admin_panel(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
-    await callback.message.edit_text(
-        "⚙️ Admin Panel\n\n"
-        "Выберите действие:",
-        reply_markup=get_admin_keyboard()
-    )
-    await callback.answer()
+    await bot.edit_message_text("⚙️ Admin Panel", callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_admin_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "admin_give")
-async def admin_give(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "admin_give")
+async def admin_give(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
-    await callback.message.edit_text(
-        "➕ Добавить запросы\n\n"
-        "Используйте команду:\n"
-        "/give @username количество\n\n"
-        "Пример: /give @Haremilove 10",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
-            ]
-        )
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel"))
+    
+    await bot.edit_message_text(
+        "➕ Добавить запросы\n\n/give @username количество",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
     )
-    await state.clear()
-    await callback.answer()
+    await callback_query.answer()
 
-@dp.message(Command("give"))
-async def cmd_give(message: Message):
+@dp.message_handler(Command("give"))
+async def cmd_give(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Доступ запрещен!")
         return
@@ -547,51 +491,44 @@ async def cmd_give(message: Message):
         await message.answer("❌ Количество должно быть числом!")
         return
     
-    # Find user by username
     db.cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,))
     result = db.cursor.fetchone()
     
     if not result:
-        await message.answer(f"❌ Пользователь @{username} не найден в базе!")
+        await message.answer(f"❌ Пользователь @{username} не найден!")
         return
     
     target_id = result[0]
     db.update_user_requests(target_id, amount)
+    await message.answer(f"✅ Выдано {amount} запросов @{username}")
     
-    await message.answer(f"✅ Выдано {amount} запросов пользователю @{username}")
-    
-    # Notify user
     try:
         await bot.send_message(
             target_id,
-            f"🎁 @Haremilove подарил вам {amount} запросов!\n"
-            f"📊 У вас {db.get_user_requests(target_id)} запросов."
+            f"🎁 @Haremilove подарил вам {amount} запросов!"
         )
-    except Exception as e:
-        logger.error(f"Failed to send notification: {e}")
+    except:
+        pass
 
-@dp.callback_query(F.data == "admin_delete")
-async def admin_delete(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "admin_delete")
+async def admin_delete(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
-    await callback.message.edit_text(
-        "➖ Удалить запросы\n\n"
-        "Используйте команду:\n"
-        "/delete @username количество\n\n"
-        "Пример: /delete @Haremilove 5",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
-            ]
-        )
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel"))
+    
+    await bot.edit_message_text(
+        "➖ Удалить запросы\n\n/delete @username количество",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
     )
-    await state.clear()
-    await callback.answer()
+    await callback_query.answer()
 
-@dp.message(Command("delete"))
-async def cmd_delete(message: Message):
+@dp.message_handler(Command("delete"))
+async def cmd_delete(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Доступ запрещен!")
         return
@@ -612,46 +549,41 @@ async def cmd_delete(message: Message):
     result = db.cursor.fetchone()
     
     if not result:
-        await message.answer(f"❌ Пользователь @{username} не найден в базе!")
+        await message.answer(f"❌ Пользователь @{username} не найден!")
         return
     
     target_id = result[0]
     current = db.get_user_requests(target_id)
     new_amount = max(0, current - amount)
     db.update_user_requests(target_id, -(current - new_amount))
-    
-    await message.answer(f"✅ Удалено {amount} запросов у пользователя @{username}")
+    await message.answer(f"✅ Удалено {amount} запросов у @{username}")
 
-@dp.callback_query(F.data == "admin_create_promo")
-async def admin_create_promo(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "admin_create_promo")
+async def admin_create_promo(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
-    await callback.message.edit_text(
-        "🎟️ Создание промокода\n\n"
-        "Используйте команду:\n"
-        "/createpromo название количество_запросов количество_использований\n\n"
-        "Пример: /createpromo Test 10 5\n"
-        "Если количество использований не указано или = -1, то бесконечно.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
-            ]
-        )
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel"))
+    
+    await bot.edit_message_text(
+        "🎟️ Создание промокода\n\n/createpromo название кол-во [использований]",
+        callback_query.message.chat.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
     )
-    await state.clear()
-    await callback.answer()
+    await callback_query.answer()
 
-@dp.message(Command("createpromo"))
-async def cmd_create_promo(message: Message):
+@dp.message_handler(Command("createpromo"))
+async def cmd_create_promo(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Доступ запрещен!")
         return
     
     args = message.text.split()
     if len(args) < 3:
-        await message.answer("❌ Использование: /createpromo название количество_запросов [количество_использований]")
+        await message.answer("❌ Использование: /createpromo название кол-во [использований]")
         return
     
     code = args[1]
@@ -661,7 +593,7 @@ async def cmd_create_promo(message: Message):
         await message.answer("❌ Количество запросов должно быть числом!")
         return
     
-    max_uses = -1  # Unlimited by default
+    max_uses = -1
     if len(args) >= 4:
         try:
             max_uses = int(args[3])
@@ -670,91 +602,63 @@ async def cmd_create_promo(message: Message):
             return
     
     if db.create_promocode(code, requests, max_uses, message.from_user.id):
-        await message.answer(
-            f"✅ Промокод создан!\n\n"
-            f"🎟️ {code}\n"
-            f"🎁 +{requests} запросов\n"
-            f"⚡ Всего использований: {'∞' if max_uses == -1 else max_uses}\n\n"
-            f"📌 Каждый день — новый промокод!\n"
-            f"Бот: @Searchusegen_bot"
-        )
+        await message.answer(f"✅ Промокод {code} создан!")
         
-        # Send promo to all users
         users = db.get_all_users()
-        sent = 0
         for user_id in users:
             try:
                 await bot.send_message(
                     user_id,
                     f"🎟️ НОВЫЙ ПРОМОКОД 🎟️\n\n"
                     f"🎟️ {code}\n"
-                    f"🎁 +{requests} запросов в боте @Searchusegen_bot\n"
-                    f"⚡ Всего использований: {'∞' if max_uses == -1 else max_uses}\n\n"
+                    f"🎁 +{requests} запросов\n"
+                    f"⚡ Всего: {'∞' if max_uses == -1 else max_uses}\n"
                     f"📌 Каждый день — новый промокод!"
                 )
-                sent += 1
-                await asyncio.sleep(0.05)  # Rate limiting
-            except Exception as e:
-                logger.error(f"Failed to send promo to {user_id}: {e}")
-        
-        await message.answer(f"✅ Промокод отправлен {sent} пользователям!")
+                await asyncio.sleep(0.05)
+            except:
+                pass
     else:
-        await message.answer("❌ Промокод с таким названием уже существует!")
+        await message.answer("❌ Промокод уже существует!")
 
-@dp.callback_query(F.data == "admin_hack_plus")
-async def admin_hack_plus(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "admin_hack_plus")
+async def admin_hack_plus(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
-    users = db.get_all_users()
-    for user_id in users:
+    for user_id in db.get_all_users():
         db.update_user_requests(user_id, 1000000000)
     
-    await callback.message.edit_text(
-        "✅ +1.000.000.000 запросов добавлено всем пользователям!",
-        reply_markup=get_admin_keyboard()
-    )
-    await callback.answer()
+    await bot.edit_message_text("✅ +1.000.000.000 всем!", callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_admin_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data == "admin_hack_minus")
-async def admin_hack_minus(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("❌ Доступ запрещен!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "admin_hack_minus")
+async def admin_hack_minus(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("❌ Доступ запрещен!", show_alert=True)
         return
     
-    users = db.get_all_users()
-    for user_id in users:
+    for user_id in db.get_all_users():
         db.update_user_requests(user_id, -1000000000)
     
-    await callback.message.edit_text(
-        "✅ -1.000.000.000 запросов списано у всех пользователей!",
-        reply_markup=get_admin_keyboard()
-    )
-    await callback.answer()
+    await bot.edit_message_text("✅ -1.000.000.000 всем!", callback_query.message.chat.id, callback_query.message.message_id, reply_markup=get_admin_keyboard())
+    await callback_query.answer()
 
-@dp.callback_query(F.data.startswith("shop_"))
-async def shop_purchase(callback: CallbackQuery):
-    await callback.answer(
-        "📩 Для покупки запросов пишите @Haremilove\n"
-        "Одним сообщением, спам = ЧС!",
-        show_alert=True
-    )
+@dp.callback_query_handler(lambda c: c.data.startswith("shop_"))
+async def shop_purchase(callback_query: types.CallbackQuery):
+    await callback_query.answer("📩 Пишите @Haremilove", show_alert=True)
 
-# --- Startup Promo ---
+# --- Startup ---
 async def init_promo():
-    """Create initial promo code if it doesn't exist"""
     if not db.get_promocode("Test"):
         db.create_promocode("Test", 1000000000000000000000, 1, OWNER_ID)
-        logger.info("✅ Initial promo 'Test' created")
+        logger.info("✅ Промокод Test создан")
 
-async def on_startup():
+async def on_startup(dp):
     await init_promo()
+    logger.info("✅ Бот запущен!")
 
 # --- Main ---
-async def main():
-    await on_startup()
-    await dp.start_polling(bot)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
